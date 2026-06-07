@@ -289,3 +289,6 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "armv7l")
     IMG_TARGET(NAME armv7_lan966x          TYPE ext4               APP app_lan966x         MACHINE lan966x)
 endif()
 
+# Standalone SPI proxy daemon for LAN80xx packages (libc only)
+add_subdirectory(spi_proxy)
+
