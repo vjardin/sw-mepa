@@ -273,6 +273,17 @@ endmacro()
 if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     APP_TARGET(NAME app_vsc7558_edsx         MESA vsc7558          MEBA meba_edsx          APP_TARGET_DEFINES -DMEPA_HAS_LAN80XX -DMEPA_HAS_VTSS -DMEPA_DEMO_EDSx)
     IMG_TARGET(NAME arm64_vsc7558_edsx       TYPE ext4             APP app_vsc7558_edsx    MACHINE fireant)
+
+    # Fully static variants for initramfs targets without a dynamic
+    # loader. Built on demand:
+    #   cmake --build <dir> --target app_vsc7558_edsx_static cli_static
+    add_executable(app_vsc7558_edsx_static EXCLUDE_FROM_ALL main.c)
+    target_link_libraries(app_vsc7558_edsx_static mepa_demo_lib mepa_demo_examples_lib
+                          json-c vsc7558_static meba_edsx_static chip_specific_api_stub -static)
+    set_target_properties(app_vsc7558_edsx_static PROPERTIES OUTPUT_NAME "mesa-demo-vsc7558.static")
+    add_executable(cli_static EXCLUDE_FROM_ALL cmd.c)
+    target_link_libraries(cli_static PUBLIC -static)
+    set_target_properties(cli_static PROPERTIES OUTPUT_NAME "mepa-cmd.static")
 elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "armv7l")
     APP_TARGET(NAME app_lan966x            MESA lan966x            MEBA meba_eds2          APP_TARGET_DEFINES -DMEPA_DEMO_EDS2)
     IMG_TARGET(NAME armv7_lan966x          TYPE ext4               APP app_lan966x         MACHINE lan966x)
