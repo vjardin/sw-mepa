@@ -20,11 +20,16 @@
 #include "microchip/ethernet/board/api.h"
 #include "main.h"
 #include "trace.h"
+#include "cli.h"
 #include "phy_only.h"
 #include "spi_proxy/spiproxy.h"
 #include <linux/gpio.h>
 #include <poll.h>
 #include "lan80xx_mcu.h"        // gpio_callback_t, lan80xx_MB_INTR_register_callback
+
+// "Dev reset [<port_no>]" CLI handler -- defined below; registered from
+// phy_only_init_modules() at the REG phase so no stock file is touched.
+static void phy_only_cli_cmd_reset(cli_req_t *req);
 
 // by default, keep legacy mode
 mesa_bool_t phy_only_mode = 0;
@@ -80,6 +85,21 @@ mesa_rc phy_only_board_conf_get(const char *tag, char *buf,
 // when this is called.
 void phy_only_init_modules(mscc_appl_init_t *init)
 {
+    if (init->cmd == MSCC_INIT_CMD_INIT) {
+        // Register "Dev reset" alongside the stock "Dev Create/Del/conf/
+        // Attach": those live in phy_port_config.c and register at the
+        // INIT phase too (phy_cli_init() via mscc_appl_phy_init below),
+        // because the CLI command list is built at INIT -- a REG-phase
+        // registration is dropped. Registering here keeps the stock file
+        // untouched. Reuses the global <port_no> parm.
+        static cli_cmd_t reset_cmd = {
+            "Dev reset [<port_no>]",
+            "Hardware-reset the LAN80xx package owning the port via the SPI "
+            "proxy (SPIPROXY_RESET); proxy mode only",
+            phy_only_cli_cmd_reset,
+        };
+        mscc_appl_cli_cmd_reg(&reset_cmd);
+    }
     if (init->cmd == MSCC_INIT_CMD_INIT) {
         // Normally issued by the (skipped) port module: wires
         // inst->phy_devices to the board state array and installs the
@@ -413,6 +433,77 @@ mesa_rc phy_only_spi_rw(mepa_port_no_t port_no, mesa_bool_t read,
         return phy_only_xfer(slot, 1, addr, data);
     }
     return phy_only_xfer(slot, 0, addr, data);
+}
+
+// Hardware-reset the LAN80xx package owning `port_no` by asking the SPI
+// proxy to pulse its reset GPIO (SPIPROXY_RESET, daemon defaults for the
+// pulse timing). Only possible in proxy mode: a direct-spidev slot has
+// no daemon and therefore no reset GPIO. The whole package is reset, so
+// the per-port -> channel mapping is irrelevant here.
+static mesa_rc phy_only_reset(mepa_port_no_t port_no)
+{
+    phy_only_slot_t *slot = NULL;
+    struct {
+        struct spiproxy_hdr   h;
+        struct spiproxy_reset r;
+    } msg;
+    int i, retry;
+    ssize_t n;
+
+    for (i = 0; i < phy_only_slot_cnt; i++) {
+        if (port_no >= phy_only_slot[i].base &&
+            port_no < phy_only_slot[i].base + phy_only_slot[i].ports) {
+            slot = &phy_only_slot[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        return MESA_RC_ERROR;
+    }
+    if (!slot->proxy) {
+        fprintf(stderr, "Dev reset: HW reset needs proxy mode "
+                "(-P proxy:<sock>); a direct spidev slot has no reset GPIO. "
+                "A soft GLOBAL_FAST_RESET over SPI wedges the chip.\n");
+        return MESA_RC_ERROR;
+    }
+    for (retry = 0; retry < 2; retry++) {
+        if (slot->fd < 0 && phy_only_proxy_connect(slot) != MESA_RC_OK) {
+            return MESA_RC_ERROR;
+        }
+        memset(&msg, 0, sizeof(msg));
+        msg.h.ver = SPIPROXY_VER;
+        msg.h.type = SPIPROXY_RESET;
+        msg.h.seq = ++slot->seq;
+        msg.h.len = sizeof(msg.r);
+        /* r.assert_us = r.deassert_us = 0 -> daemon defaults (10/100 ms) */
+        if (send(slot->fd, &msg, sizeof(msg), MSG_NOSIGNAL) < 0 ||
+            (n = recv(slot->fd, &msg, sizeof(msg), 0)) < (ssize_t)sizeof(msg.h)) {
+            close(slot->fd);
+            slot->fd = -1;
+            continue; /* daemon gone: reconnect once */
+        }
+        if (msg.h.seq != slot->seq ||
+            msg.h.type != (SPIPROXY_RESET | SPIPROXY_RESP)) {
+            return MESA_RC_ERROR;
+        }
+        if (msg.h.flags == SPIPROXY_ENOSYS) {
+            fprintf(stderr, "Dev reset: the daemon has no reset GPIO -- start "
+                    "lan80xx-spid with -r <line-name> (e.g. -r lan8023-rst)\n");
+            return MESA_RC_ERROR;
+        }
+        return msg.h.flags == SPIPROXY_OK ? MESA_RC_OK : MESA_RC_ERROR;
+    }
+    return MESA_RC_ERROR;
+}
+
+static void phy_only_cli_cmd_reset(cli_req_t *req)
+{
+    if (phy_only_reset(req->port_no) == MESA_RC_OK) {
+        cli_printf("Dev reset: port %u package HW-reset via proxy "
+                   "(PHY released, run state)\n", req->port_no);
+    } else {
+        cli_printf("Dev reset: port %u failed\n", req->port_no);
+    }
 }
 
 // LAN80xx mailbox host-interrupt (MDINT) over a Linux GPIO line.
