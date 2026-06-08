@@ -36,6 +36,7 @@
 #include <sys/un.h>
 #include <linux/types.h>
 #include <linux/spi/spidev.h>
+#include <linux/gpio.h>
 
 #include "spiproxy.h"
 
@@ -44,6 +45,8 @@
 #define TRACE_RING     1024
 #define SPI_BYTES      7        /* 3 address + 4 data                    */
 #define SPI_PAD_MAX    15
+#define RST_ASSERT_US    10000  /* default HW-reset assert  (10 ms)      */
+#define RST_DEASSERT_US  100000 /* default HW-reset settle  (100 ms)     */
 #define DEVID_MMD      0x1e
 #define DEVID_REG      0x0000
 
@@ -91,6 +94,8 @@ static struct {
     const char *dev, *sock;
     int spi_fd, srv_fd, ep_fd;
     int pad, freq;
+    const char *rst_line;   /* reset GPIO line name (-r), NULL = disabled */
+    int         rst_fd;     /* GPIO_V2 line-request fd, -1 = unavailable  */
     client_t cl[MAX_CLIENTS];
     uint32_t next_cid;
     /* queues: 0 = high (PTP), 1 = normal, 2 = low (debug) */
@@ -657,6 +662,77 @@ static void claim_end(int abnormal)
     g.claim_deadline = 0;
 }
 
+/*
+ * Reset GPIO via the kernel GPIO v2 character-device uapi (libc-only,
+ * no libgpiod). Resolve the line by NAME (the gpio-line-names entry
+ * the board DT assigns, e.g. "lan8023-rst") so the daemon does not
+ * hard-code a chip/offset. Requested as output; the line comes up LOW
+ * = deasserted (PHY running). Returns the line-request fd or -1.
+ */
+static int gpio_open_line_by_name(const char *name)
+{
+    char path[sizeof("/dev/gpiochip") + 11];   /* + up to 11 digits of an int */
+    int n, fd = -1;
+
+    for (n = 0; n < 64 && fd < 0; n++) {
+        struct gpiochip_info ci;
+        uint32_t off;
+        int chip;
+
+        snprintf(path, sizeof(path), "/dev/gpiochip%d", n);
+        chip = open(path, O_RDONLY | O_CLOEXEC);
+        if (chip < 0)
+            continue;
+        memset(&ci, 0, sizeof(ci));
+        if (ioctl(chip, GPIO_GET_CHIPINFO_IOCTL, &ci) == 0) {
+            for (off = 0; off < ci.lines; off++) {
+                struct gpio_v2_line_info li;
+                struct gpio_v2_line_request req;
+
+                memset(&li, 0, sizeof(li));
+                li.offset = off;
+                if (ioctl(chip, GPIO_V2_GET_LINEINFO_IOCTL, &li) ||
+                    strcmp(li.name, name))
+                    continue;
+                memset(&req, 0, sizeof(req));
+                req.offsets[0] = off;
+                req.num_lines = 1;
+                req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
+                strncpy(req.consumer, "lan80xx-spid",
+                        sizeof(req.consumer) - 1);
+                if (ioctl(chip, GPIO_V2_GET_LINE_IOCTL, &req) == 0 &&
+                    req.fd >= 0) {
+                    fd = req.fd;
+                    fprintf(stderr, "reset GPIO '%s' = %s line %u\n",
+                            name, ci.name, off);
+                }
+                break;
+            }
+        }
+        close(chip);
+    }
+    if (fd < 0)
+        fprintf(stderr, "reset GPIO '%s' not found on any gpiochip\n", name);
+    return fd;
+}
+
+static int gpio_set(int fd, int value)
+{
+    struct gpio_v2_line_values v = { .bits = value ? 1 : 0, .mask = 1 };
+
+    return ioctl(fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &v);
+}
+
+/* Pulse the reset line: assert (ACTIVE_HIGH -> high), hold, release
+ * (low -> PHY runs), settle. Caller has ensured g.rst_fd >= 0. */
+static void gpio_pulse_reset(uint32_t assert_us, uint32_t deassert_us)
+{
+    gpio_set(g.rst_fd, 1);
+    usleep(assert_us);
+    gpio_set(g.rst_fd, 0);
+    usleep(deassert_us);
+}
+
 static void exec_item(qitem_t *it)
 {
     client_t *c = it->c;
@@ -740,8 +816,9 @@ static void exec_item(qitem_t *it)
     }
     case SPIPROXY_STATS: {
         len = snprintf(txt, sizeof(txt),
-                       "dev=%s freq=%d pad=%d reads=%llu writes=%llu io_err=%llu warns=%llu queued=%d claim=%u mb_inflight=%d\n",
+                       "dev=%s freq=%d pad=%d rst=%s reads=%llu writes=%llu io_err=%llu warns=%llu queued=%d claim=%u mb_inflight=%d\n",
                        g.dev, g.freq, g.pad,
+                       g.rst_fd >= 0 ? (g.rst_line ? g.rst_line : "on") : "off",
                        (unsigned long long)g.n_reads,
                        (unsigned long long)g.n_writes,
                        (unsigned long long)g.n_io_err,
@@ -772,6 +849,33 @@ static void exec_item(qitem_t *it)
                             e->reg, e->val);
         }
         send_resp(c, h, SPIPROXY_OK, txt, (uint32_t)len);
+        return;
+    }
+    case SPIPROXY_RESET: {
+        struct spiproxy_reset *rq = (struct spiproxy_reset *)it->body;
+        uint32_t a, d;
+
+        if (h->len != sizeof(*rq)) {
+            send_resp(c, h, SPIPROXY_EINVAL, NULL, 0);
+            return;
+        }
+        if (g.rst_fd < 0) {     /* no reset line configured (-r) / found */
+            send_resp(c, h, SPIPROXY_ENOSYS, NULL, 0);
+            return;
+        }
+        a = rq->assert_us ? rq->assert_us : RST_ASSERT_US;
+        d = rq->deassert_us ? rq->deassert_us : RST_DEASSERT_US;
+        /*
+         * Single-threaded loop + sole spidev owner: no SPI op is in
+         * flight here, so the HW reset is atomic vs all client traffic.
+         * After this the chip is fresh, so any in-flight mailbox guard
+         * is moot -- clear it.
+         */
+        g.mb_inflight = 0;
+        gpio_pulse_reset(a, d);
+        log_line("C%u(%s) seq=%u RESET hw assert=%uus deassert=%uus", c->id,
+                 c->comm, h->seq, a, d);
+        send_resp(c, h, SPIPROXY_OK, NULL, 0);
         return;
     }
     default:
@@ -950,6 +1054,8 @@ static void usage(const char *p)
             "  -s  listening socket (default %s)\n"
             "  -p  SPI padding bytes for reads (default 1)\n"
             "  -f  SPI clock in Hz (default 5000000)\n"
+            "  -r  reset GPIO line NAME (e.g. lan8023-rst) -- enables the\n"
+            "      SPIPROXY_RESET op (HW reset pulse); off if absent\n"
             "  -L  full event log to <file> ('-' = stderr): every message,\n"
             "      register op (incl. batch/claim-cleanup/mailbox internals),\n"
             "      claim + client lifecycle\n", p, SPIPROXY_SOCK);
@@ -965,12 +1071,14 @@ int main(int argc, char **argv)
     g.sock = SPIPROXY_SOCK;
     g.pad = 1;
     g.freq = 5000000;
-    while ((o = getopt(argc, argv, "d:s:p:f:L:h")) != -1) {
+    g.rst_fd = -1;
+    while ((o = getopt(argc, argv, "d:s:p:f:r:L:h")) != -1) {
         switch (o) {
         case 'd': g.dev = optarg; break;
         case 's': g.sock = optarg; break;
         case 'p': g.pad = atoi(optarg); break;
         case 'f': g.freq = atoi(optarg); break;
+        case 'r': g.rst_line = optarg; break;
         case 'L':
             g.log = strcmp(optarg, "-") ? fopen(optarg, "w") : stderr;
             if (g.log == NULL) {
@@ -1002,6 +1110,10 @@ int main(int argc, char **argv)
     } else {
         fprintf(stderr, "%s: LAN80xx DEVICE_ID %#06x\n", g.dev, id);
     }
+
+    /* Optional HW reset line (-r <line-name>): enables SPIPROXY_RESET. */
+    if (g.rst_line)
+        g.rst_fd = gpio_open_line_by_name(g.rst_line);
 
     strncpy(sa.sun_path, g.sock, sizeof(sa.sun_path) - 1);
     unlink(g.sock);

@@ -30,6 +30,7 @@ enum spiproxy_type {
     SPIPROXY_TSFIFO_SUB, /* reserved -- ENOSYS in this version           */
     SPIPROXY_BER_WINDOW, /* reserved -- ENOSYS in this version           */
     SPIPROXY_DFU,        /* reserved -- ENOSYS in this version           */
+    SPIPROXY_RESET,      /* body: spiproxy_reset; pulse the HW reset GPIO */
 };
 #define SPIPROXY_RESP 0x80
 
@@ -86,6 +87,17 @@ struct spiproxy_mb {
     uint8_t  cmd;        /* enDEVICE_COMMANDS_T id                       */
     uint16_t payload_len;
     uint32_t timeout_ms; /* 0 = default 500 ms                           */
+};
+
+/* Hardware reset: the daemon pulses the LAN80xx reset line (the GPIO
+ * named by `lan80xx-spid -r <line-name>`, e.g. "lan8023-rst" = U800
+ * P1_7, ACTIVE_HIGH). The clean full reset that a soft GLOBAL_FAST_RESET
+ * over SPI cannot do from a running OS (it wedges -- see the debug doc).
+ * 0 fields use the daemon defaults (10 ms assert / 100 ms deassert).
+ * Status SPIPROXY_ENOSYS if no reset line was configured/found. */
+struct spiproxy_reset {
+    uint32_t assert_us;
+    uint32_t deassert_us;
 };
 
 #endif /* SPIPROXY_H */

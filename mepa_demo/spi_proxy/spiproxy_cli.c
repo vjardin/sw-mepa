@@ -9,6 +9,7 @@
 //   spiproxy-cli [-s sock] hammer <seconds>       # low-prio read flood
 //   spiproxy-cli [-s sock] claimtest <ms>         # claim, read, hold, release
 //   spiproxy-cli [-s sock] mailbox <cmd> [hexbytes] [timeout_ms]
+//   spiproxy-cli [-s sock] reset [assert_us [deassert_us]]  # HW reset pulse
 //   spiproxy-cli [-s sock] stats | trace
 
 #define _GNU_SOURCE
@@ -120,6 +121,21 @@ int main(int argc, char **argv)
         op.val = (uint32_t)strtoul(argv[4], NULL, 0);
         rlen = sizeof(op);
         st = xfer(SPIPROXY_WRITE, 0, &op, sizeof(op), &op, &rlen);
+        printf("status=%d\n", st);
+        return st != SPIPROXY_OK;
+    }
+    if (!strcmp(argv[0], "reset")) {
+        struct spiproxy_reset rq = { 0 };
+
+        if (argc >= 2)
+            rq.assert_us = (uint32_t)strtoul(argv[1], NULL, 0);
+        if (argc >= 3)
+            rq.deassert_us = (uint32_t)strtoul(argv[2], NULL, 0);
+        st = xfer(SPIPROXY_RESET, 0, &rq, sizeof(rq), NULL, NULL);
+        if (st == SPIPROXY_ENOSYS)
+            fprintf(stderr,
+                    "reset: daemon has no reset GPIO configured (start it"
+                    " with -r <line-name>, e.g. -r lan8023-rst)\n");
         printf("status=%d\n", st);
         return st != SPIPROXY_OK;
     }
