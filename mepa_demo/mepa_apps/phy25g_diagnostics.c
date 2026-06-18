@@ -447,7 +447,7 @@ static void cli_cmd_serdes_get(cli_req_t *req)
 static void cli_cmd_tx_eqa(cli_req_t *req)
 {
     phy25g_appl_diag_t *mreq = req->module_req;
-    phy25g_tx_rx_equa_conf_t tx_conf;
+    phy25g_tx_rx_equa_conf_t tx_conf = {0};
     mepa_rc rc;
     if (!req->set) {
         cli_printf("\n Syntax : mepa-cmd tx_eqa <port_no> [host|line] amp <equ_val> tap_dly <equ_val> tap_adv <equ_val>\n");
@@ -474,7 +474,7 @@ static void cli_cmd_tx_eqa(cli_req_t *req)
 static void cli_cmd_rx_eqa(cli_req_t *req)
 {
     phy25g_appl_diag_t *mreq = req->module_req;
-    phy25g_tx_rx_equa_conf_t rx_conf;
+    phy25g_tx_rx_equa_conf_t rx_conf = {0};
     mepa_rc rc;
     if (!req->set) {
         cli_printf("\n Syntax : mepa-cmd rx_eqa <port_no> [host|line] [dfe_adp|dfe_man|disable] ctle_r <equ_val> ctle_c <equ_val> vga <equ_val>\n");
