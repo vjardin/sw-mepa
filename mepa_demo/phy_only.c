@@ -21,7 +21,12 @@
 #include "main.h"
 #include "trace.h"
 #include "phy_only.h"
-#include "spi_proxy/spiproxy.h"
+#ifdef MEPA_HAS_SPIPROXY
+// Optional: provided by the external mepa_spidev_proxy dev package
+// (find_package(mepa_spidev_proxy) in mepa_demo/CMakeLists.txt). When absent the
+// '-P proxy:<sock>' client mode below is compiled out.
+#include <spi_proxy/spiproxy.h>
+#endif
 #include <linux/gpio.h>
 #include <poll.h>
 #include "lan80xx_mcu.h"        // gpio_callback_t, lan80xx_MB_INTR_register_callback
@@ -182,6 +187,11 @@ static mesa_rc phy_only_slot_opt(char *parm)
     slot->ports = 4;
 
     if (strncmp(parm, "proxy:", 6) == 0) {
+#ifndef MEPA_HAS_SPIPROXY
+        fprintf(stderr, "-P proxy: not built: install the mepa_spidev_proxy dev "
+                "package and rebuild to enable SPI-proxy client mode\n");
+        return MESA_RC_ERROR;
+#else
         // via lan80xx-spid: proxy:<socket-path>[:ports], pad/freq
         // belong to the daemon. ':ports' = trailing ':' + digits.
         slot->proxy = 1;
@@ -190,6 +200,7 @@ static mesa_rc phy_only_slot_opt(char *parm)
             *s++ = 0;
             slot->ports = atoi(s);
         }
+#endif
     } else {
         if ((s = strchr(parm, ':')) != NULL) {
             *s++ = 0;
@@ -246,6 +257,7 @@ void phy_only_opt_reg(void)
     mscc_appl_opt_reg(&phy_only_opt);
 }
 
+#ifdef MEPA_HAS_SPIPROXY
 // Connect (or reconnect after a daemon restart) a proxy-mode slot
 static mesa_rc phy_only_proxy_connect(phy_only_slot_t *slot)
 {
@@ -264,6 +276,7 @@ static mesa_rc phy_only_proxy_connect(phy_only_slot_t *slot)
     slot->fd = fd;
     return MESA_RC_OK;
 }
+#endif
 
 mesa_rc phy_only_slots_open(void)
 {
@@ -271,12 +284,14 @@ mesa_rc phy_only_slots_open(void)
 
     phy_only_trace_init();
     for (i = 0; i < phy_only_slot_cnt; i++) {
+#ifdef MEPA_HAS_SPIPROXY
         if (phy_only_slot[i].proxy) {
             if (phy_only_proxy_connect(&phy_only_slot[i]) != MESA_RC_OK) {
                 return MESA_RC_ERROR;
             }
             continue;
         }
+#endif
         fd = open(phy_only_slot[i].dev, O_RDWR);
         if (fd < 0) {
             fprintf(stderr, "%s: %s\n", phy_only_slot[i].dev, strerror(errno));
@@ -327,6 +342,7 @@ static mesa_rc phy_only_xfer(phy_only_slot_t *slot, mesa_bool_t read,
     return MESA_RC_OK;
 }
 
+#ifdef MEPA_HAS_SPIPROXY
 // Register access through the SPI proxy:
 // one L1 READ/WRITE request/response (the daemon handles the pipelined
 // dummy read).
@@ -374,6 +390,7 @@ static mesa_rc phy_only_proxy_rw(phy_only_slot_t *slot, uint32_t ch_no,
     }
     return MESA_RC_ERROR;
 }
+#endif /* MEPA_HAS_SPIPROXY */
 
 // SPI register access for a demo port through the -P slot table. Same
 // register/channel encoding as the built-in slots.
@@ -398,9 +415,11 @@ mesa_rc phy_only_spi_rw(mepa_port_no_t port_no, mesa_bool_t read,
         phy_only_trace_op(port_no, read, mmd, reg_num);
     }
     ch_no = slot->base + slot->ports - 1 - port_no;
+#ifdef MEPA_HAS_SPIPROXY
     if (slot->proxy) {
         return phy_only_proxy_rw(slot, ch_no, read, mmd, reg_num, data);
     }
+#endif
     if (slot->fd <= 0) {
         return MESA_RC_ERROR;
     }
