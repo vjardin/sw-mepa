@@ -106,6 +106,18 @@ add_library(mepa_demo_lib STATIC trace.c cli.c port.c mac.c vlan.c packet.c ip.c
                                  example.c kr.c intr.c phy_only.c ${MEPA_APP_SRC})
 target_include_directories(mepa_demo_lib PUBLIC ${CMAKE_BINARY_DIR}/mesa-ag/)
 
+# Optional: the external mepa_spidev_proxy dev package
+# When it is installed and found, phy_only.c gets its '-P proxy:<sock>'
+# SPI-proxy client mode; otherwise the demo builds without it.
+find_package(mepa_spidev_proxy CONFIG QUIET)
+if (mepa_spidev_proxy_FOUND)
+    target_link_libraries(mepa_demo_lib PRIVATE mepa_spidev_proxy::spiproxy)
+    target_compile_definitions(mepa_demo_lib PRIVATE MEPA_HAS_SPIPROXY)
+    message(STATUS "mepa_spidev_proxy found: PHY-only '-P proxy:<sock>' mode enabled")
+else()
+    message(STATUS "mepa_spidev_proxy not found: PHY-only '-P proxy:<sock>' mode disabled")
+endif()
+
 file(GLOB_RECURSE EXAMPLE_SRC
      LIST_DIRECTORIES false
      CONFIGURE_DEPENDS
@@ -288,7 +300,4 @@ elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "armv7l")
     APP_TARGET(NAME app_lan966x            MESA lan966x            MEBA meba_eds2          APP_TARGET_DEFINES -DMEPA_DEMO_EDS2)
     IMG_TARGET(NAME armv7_lan966x          TYPE ext4               APP app_lan966x         MACHINE lan966x)
 endif()
-
-# Standalone SPI proxy daemon for LAN80xx packages (libc only)
-add_subdirectory(spi_proxy)
 
